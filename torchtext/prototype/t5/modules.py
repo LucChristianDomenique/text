@@ -622,3 +622,113 @@ class T5Layer(nn.Module):
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout2(self.activation(self.linear1(x))))
         return self.dropout3(x)
+
+
+# NOTE: Comparable HuggingFace implentation can be found at https://github.com/huggingface/transformers/blob/8581a798c0a48fca07b29ce2ca2ef55adcae8c7e/src/transformers/models/t5/modeling_t5.py#L835
+class T5Stack(nn.Module):
+    r"""T5 is a stack of N encoder/decoder layers
+    Args:
+        is_decoder: Whether or not the layer belongs to the decoder. (required)
+        d_model: Number of expected features in the input (required).
+        nhead: Number of heads in the multihead attention models (required).
+        num_layers: Number of encoder/decoder layers in the stack (required)
+        dim_feedforward: Dimension of the feedforward network model (default=3072).
+        dropout: Dropout value (default=0.1).
+        activation: Activation function of the intermediate layer, can be a string
+            ("relu" or "gelu") or a unary callable. (default: relu)
+        layer_norm_eps: The eps value in layer normalization components (default=1e-6).
+        relative_attention_num_buckets: Number of relative position buckets (default: 32)
+        relative_attention_max_distance: Maximum threshold on the relative distance used to
+            allocate buckets. Anything larger gets placed in the same bucket (defulat: 128)
+    Examples::
+        >>> decoder = nn.T5Stack(is_decoder=True, d_model=768, nhead=12, num_layers=12)
+        >>> memory = torch.rand(32, 10, 512)
+        >>> tgt = torch.rand(32, 10, 512)
+        >>> out = decoder(tgt, memory)
+    """
+
+    def __init__(
+        self,
+        is_decoder: bool,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int = 3072,
+        dropout: float = 0.1,
+        activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
+        layer_norm_eps: float = 1e-6,
+        relative_attention_num_buckets: int = 32,
+        relative_attention_max_distance: int = 128,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+
+        self.layers = nn.ModuleList(
+            [
+                T5Layer(
+                    is_decoder,
+                    d_model,
+                    nhead,
+                    dim_feedforward,
+                    dropout,
+                    activation,
+                    layer_norm_eps,
+                    relative_attention_num_buckets,
+                    relative_attention_max_distance,
+                    compute_relative_attention_bias=True if i == 0 else False,
+                    relative_attention_bias=nn.Embedding(relative_attention_num_buckets, nhead) if i == 0 else None,
+                    device=device,
+                    dtype=dtype,
+                )
+                for i in range(num_layers)
+            ]
+        )
+        self.num_layers = num_layers
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor = None,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tuple[Tensor], Tensor, Tuple[Tensor], Tuple[Tensor]]:
+        r"""Pass the inputs (and mask) through the stack of encoder/decoder layers.
+        Args:
+            tgt: Input sequence to the encoder/decoder layer. (required).
+                Must have shape (B, Nt, E) where B is the batch size, Nt is the target sequence
+                length, and E is the model dimension.
+            memory: Sequence from the last layer of the encoder (used for decoder only). (required).
+                Must have shape (B, Nts, E) where B is the batch size, Ns is the source sequence
+                length, and E is the model dimension.
+            tgt_mask: Attention mask for self-attention. (optional).
+                Must have shape (Nt, Nt).
+            memory_mask: Attention mask for cross-attention (decoder-only) (optional).
+                Must have shape (Nt, Ns).
+            tgt_key_padding_mask: Mask for the tgt keys per batch (optional).
+                Must have shape (B, Nt).
+            memory_key_padding_mask: Mask for the memory keys per batch (decoder-only) (optional).
+                Must have shape (B, Ns).
+        """
+        output = tgt
+        position_bias = None
+        all_outputs = ()
+        all_sa_scores = ()
+        all_ca_scores = ()
+        for mod in self.layers:
+            all_outputs = all_outputs + (output,)
+            output, position_bias, sa_score, ca_score = mod(
+                output,
+                memory,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                position_bias=position_bias,
+            )
+            all_sa_scores = all_sa_scores + (sa_score,)
+            all_ca_scores = all_ca_scores + (ca_score,)
+
+        return output, all_outputs, position_bias, all_sa_scores, all_ca_scores
